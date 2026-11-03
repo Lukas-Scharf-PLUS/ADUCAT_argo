@@ -1,0 +1,296 @@
+# Argo workflow: the full InSAR chain from Sentinel-1 download to point file.
+#
+#   download-slc -> download-orbits -> compass -> dolphin -> postprocess
+#
+# All steps share one volume (ephemeral-workdir, mounted at /work):
+#
+#   /work/input/      slc/, orbits/        downloaded by the first two steps
+#                     dem/, watermask/,    loaded from the bucket as input artifacts
+#                     burst_db/, config/
+#   /work/processed/  compass/             GSLCs (compass/gslcs) and COMPASS logs
+#                     dolphin/             dolphin's work directory
+#   /work/final/      dolphin_points.parquet
+#
+# compass, dolphin and postprocess each upload their output folder as an output
+# artifact to <s3_output_prefix>/<workflow name>/..., so runs never overwrite
+# each other. The downloaded SLCs and orbits are not uploaded.
+#
+# Submit with:  argo submit workflows/insar_pipeline.yaml
+# Other dates:  argo submit workflows/insar_pipeline.yaml -p start_date=... -p end_date=...
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: insar-pipeline-
+spec:
+  entrypoint: main
+  serviceAccountName: aducat
+  arguments:
+    parameters:
+      # --- SLC search (slc-downloader) ---
+      - name: orbit_state
+        value: ascending
+      - name: relative_orbit
+        value: "73"                    # must match slc_dir in the COMPASS config
+      - name: instrument_mode
+        value: IW
+      - name: start_date
+        value: "2025-01-01"
+      - name: end_date
+        value: "2025-02-28"            # inclusive; a 2-month test stack
+      - name: slc_bbox
+        value: 16.18 48.11 16.59 48.33 # WEST SOUTH EAST NORTH, covers the dolphin bounds
+      - name: slc_max_threads
+        value: "4"                     # CDSE allows 4 connections per user
+
+      # --- inputs from the bucket (keys in the artifact repository bucket) ---
+      - name: dem_key
+        value: WP5_Infrastructure_and_Underground_Safety/DEM/cop_dem.tif
+      - name: watermask_key
+        value: WP5_Infrastructure_and_Underground_Safety/Watermask/watermask.tif
+      - name: burst_db_key
+        value: WP5_Infrastructure_and_Underground_Safety/s1-burst-db/opera-burst-bbox-only.sqlite3
+      - name: compass_config_key
+        value: WP5_Infrastructure_and_Underground_Safety/argo_configs/ASC_073/compass.yaml
+      - name: dolphin_config_key
+        value: WP5_Infrastructure_and_Underground_Safety/argo_configs/ASC_073/dolphin.yaml
+
+      # --- outputs ---
+      - name: s3_output_prefix
+        value: WP5_Infrastructure_and_Underground_Safety/insar_pipeline
+
+      # --- images ---
+      # Pin sha-<commit> or version tags for reproducible runs; `latest` changes
+      # with every push to main.
+      - name: downloader_image
+        value: ghcr.io/lukas-scharf-plus/slc_downloader:sha-3e3f8cc
+      - name: compass_dolphin_image
+        value: ghcr.io/lukas-scharf-plus/compass-dolphin:latest
+      - name: postprocessing_image
+        value: ghcr.io/lukas-scharf-plus/dolphin_postprocessing:sha-761fc04
+
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: download-slc
+            template: download-slc
+          - name: download-orbits
+            template: download-orbits
+            dependencies: [download-slc]
+          - name: compass
+            template: compass
+            dependencies: [download-orbits]
+          - name: dolphin
+            template: dolphin
+            dependencies: [compass]
+          - name: postprocess
+            template: postprocess
+            dependencies: [dolphin]
+
+    - name: download-slc
+      container:
+        image: "{{workflow.parameters.downloader_image}}"
+        # `command` replaces the image ENTRYPOINT; _entrypoint.sh activates the
+        # micromamba environment, so it has to stay in front of python.
+        command: [/usr/local/bin/_entrypoint.sh, python]
+        args:
+          - src/download_slc.py
+          - --orbit_state
+          - "{{workflow.parameters.orbit_state}}"
+          - --relative_orbit
+          - "{{workflow.parameters.relative_orbit}}"
+          - --instrument_mode
+          - "{{workflow.parameters.instrument_mode}}"
+          - --start_date
+          - "{{workflow.parameters.start_date}}"
+          - --end_date
+          - "{{workflow.parameters.end_date}}"
+          - --bbox
+          - "{{workflow.parameters.slc_bbox}}"
+          - --max_threads
+          - "{{workflow.parameters.slc_max_threads}}"
+          - --threads_per_file
+          - "1"
+          - --base_path
+          - /work/input/slc
+        env:
+          - name: cdse_S3_KEY
+            valueFrom:
+              secretKeyRef: {name: cdse, key: S3_KEY}
+          - name: cdse_S3_SECRET
+            valueFrom:
+              secretKeyRef: {name: cdse, key: S3_SECRET}
+        resources:
+          requests: {cpu: "2", memory: 4Gi}
+          limits: {cpu: "4", memory: 8Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: IfNotPresent
+
+    - name: download-orbits
+      container:
+        image: "{{workflow.parameters.downloader_image}}"
+        command: [/usr/local/bin/_entrypoint.sh, python]
+        args:
+          - src/download_orbits.py
+          - --safe_dir
+          - /work/input/slc
+          - --orbit_dir
+          - /work/input/orbits
+        env:
+          - name: cdse_S3_KEY
+            valueFrom:
+              secretKeyRef: {name: cdse, key: S3_KEY}
+          - name: cdse_S3_SECRET
+            valueFrom:
+              secretKeyRef: {name: cdse, key: S3_SECRET}
+        resources:
+          requests: {cpu: "1", memory: 1Gi}
+          limits: {cpu: "2", memory: 2Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: IfNotPresent
+
+    # GSLCs from the SLCs. Argo loads the input artifacts straight into the
+    # shared volume, because their paths lie under its mount point.
+    - name: compass
+      inputs:
+        artifacts:
+          - name: dem
+            path: /work/input/dem/cop_dem.tif
+            s3: {key: "{{workflow.parameters.dem_key}}"}
+          - name: burst-db
+            path: /work/input/burst_db/opera-burst-bbox-only.sqlite3
+            s3: {key: "{{workflow.parameters.burst_db_key}}"}
+          - name: compass-config
+            path: /work/input/config/compass.yaml
+            s3: {key: "{{workflow.parameters.compass_config_key}}"}
+      outputs:
+        artifacts:
+          - name: compass
+            path: /work/processed/compass
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/processed/compass"
+            archive:
+              none: {}                 # upload the folders as they are, no .tgz
+      container:
+        image: "{{workflow.parameters.compass_dolphin_image}}"
+        command: [/usr/local/bin/_entrypoint.sh, python, /app/run_pipeline.py]
+        args:
+          - compass
+          - --compass-config
+          - /work/input/config/compass.yaml
+        # COMPASS runs n_workers x threads_per_worker = 2 x 4 threads (see the config).
+        resources:
+          requests: {cpu: "8", memory: 32Gi}
+          limits: {cpu: "16", memory: 64Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: Always
+
+    # Displacement time series from the GSLCs. Also stitches the static layers
+    # to /work/processed/dolphin/geometry, using the DEM loaded by the compass step.
+    - name: dolphin
+      inputs:
+        artifacts:
+          - name: watermask
+            path: /work/input/watermask/watermask.tif
+            s3: {key: "{{workflow.parameters.watermask_key}}"}
+          - name: dolphin-config
+            path: /work/input/config/dolphin.yaml
+            s3: {key: "{{workflow.parameters.dolphin_config_key}}"}
+      outputs:
+        artifacts:
+          - name: dolphin
+            path: /work/processed/dolphin
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/processed/dolphin"
+            archive:
+              none: {}
+      container:
+        image: "{{workflow.parameters.compass_dolphin_image}}"
+        command: [/usr/local/bin/_entrypoint.sh, python, /app/run_pipeline.py]
+        args:
+          - dolphin
+          - --dolphin-config
+          - /work/input/config/dolphin.yaml
+          - --gslc-dir
+          - /work/processed/compass/gslcs
+        resources:
+          requests: {cpu: "8", memory: 32Gi}
+          limits: {cpu: "16", memory: 64Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: Always
+
+    # One GeoParquet point file with EGMS-style model parameters.
+    - name: postprocess
+      outputs:
+        artifacts:
+          - name: points
+            path: /work/final
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/final"
+            archive:
+              none: {}
+      container:
+        image: "{{workflow.parameters.postprocessing_image}}"
+        command: [/usr/local/bin/_entrypoint.sh, python, /app/run_postprocessing.py]
+        args:
+          - --dolphin-dir
+          - /work/processed/dolphin
+          - --output
+          - /work/final/dolphin_points.parquet
+        resources:
+          requests: {cpu: "2", memory: 8Gi}
+          limits: {cpu: "4", memory: 16Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: IfNotPresent
+
+  # All three images run as the non-root user "mambauser" (UID/GID 57439);
+  # fsGroup makes the volume writable for that user.
+  securityContext:
+    runAsUser: 57439
+    runAsGroup: 57439
+    fsGroup: 57439
+    runAsNonRoot: true
+
+  volumeClaimTemplates:
+    - metadata:
+        name: ephemeral-workdir
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            # ~8 GB per IW SLC (2 months of track 73 is about 5-10 scenes),
+            # plus GSLCs and dolphin output. Raise for longer periods.
+            storage: 150Gi
+        storageClassName: csi-disk
+
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node_group
+                operator: In
+                values: [usera]
+  tolerations:
+    - key: hub.jupyter.org_dedicated
+      operator: Equal
+      value: usera
+      effect: NoSchedule
+
+  # Delete the workflow 5 minutes after success; keep a failed one for 2 hours
+  # so its logs can be inspected.
+  ttlStrategy:
+    secondsAfterSuccess: 300
+    secondsAfterFailure: 7200
+  podGC:
+    strategy: OnWorkflowSuccess

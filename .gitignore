@@ -1,0 +1,11 @@
+# Editor / IDE settings
+.idea/
+.vscode/
+
+# Local Claude Code settings (machine-specific)
+.claude/
+
+# Secrets
+.env
+*.key
+*.pem

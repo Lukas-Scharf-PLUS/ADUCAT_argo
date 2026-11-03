@@ -1,0 +1,32 @@
+# COMPASS config for the Argo InSAR pipeline: Vienna, ascending track 73.
+#
+# Same settings as compass_dolphin_claude/config/compass.yaml, but every path is a
+# path inside the containers. The workflow loads the inputs to these paths and
+# writes the output on the shared volume mounted at /work.
+# Upload this file to the bucket at the key given by the workflow parameter
+# `compass_config_key`.
+
+inputs:
+  # The SLC download step writes to /work/input/slc/S1_<track>_<ASC|DES>/.
+  slc_dir: /work/input/slc/S1_073_ASC
+  orbit_dir: /work/input/orbits
+  dem_file: /work/input/dem/cop_dem.tif
+  burst_db_file: /work/input/burst_db/opera-burst-bbox-only.sqlite3
+
+# GSLCs go to /work/processed/compass/gslcs, logs to /work/processed/compass/logs.
+work_dir: /work/processed/compass
+
+# Bursts to process, all from one track.
+burst_ids:
+  - t073_154935_iw1
+  - t073_154935_iw2
+
+geocoding:
+  x_posting_m: 5
+  y_posting_m: 10
+  common_bursts_only: true  # Drop bursts that are missing on any date.
+  generate_static_layers: true  # Layover/shadow masks and viewing geometry.
+  # n_workers x threads_per_worker should match the CPU request of the compass
+  # step in the workflow (8 CPUs).
+  n_workers: 2
+  threads_per_worker: 4
