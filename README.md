@@ -68,6 +68,21 @@ the previous ones:
 The workflow name (e.g. `insar-pipeline-x7k2p`) is unique per run, so runs never
 overwrite each other. The downloaded SLCs and orbits are not uploaded.
 
+**Logs.** Each step pipes its full console output (stdout and stderr) through
+`tee` into a log file, which is uploaded with the step's outputs, also when the
+step fails:
+
+```
+<s3_output_prefix>/<workflow name>/logs/download-slc.log
+<s3_output_prefix>/<workflow name>/logs/download-orbits.log
+<s3_output_prefix>/<workflow name>/processed/compass/logs/run_pipeline_compass.log
+<s3_output_prefix>/<workflow name>/processed/dolphin/run_pipeline_dolphin.log
+<s3_output_prefix>/<workflow name>/final/run_postprocessing.log
+```
+
+COMPASS's per-job logs (`processed/compass/logs/`) and dolphin's own `dolphin.log`
+(`processed/dolphin/`) are uploaded as before.
+
 COMPASS and dolphin are separate steps of the same image. If dolphin fails, the
 GSLCs have already been uploaded, and COMPASS does not have to be repeated.
 
@@ -114,7 +129,8 @@ For a longer period, also raise the volume size (`storage` under
   `relative_orbit` and `orbit_state` parameters; the download step writes to
   `/work/input/slc/S1_<track, 3 digits>_<ASC|DES>`.
 - **Resources:** compass and dolphin request 8 CPUs and 32 GiB memory (limit
-  16 CPUs, 64 GiB). `n_workers × threads_per_worker` in `compass.yaml` should
+  15 CPUs, 56 GiB: the cluster allows at most this per container and refuses
+  larger limits). `n_workers × threads_per_worker` in `compass.yaml` should
   match the CPU request. Lower the requests if pods stay `Pending` because no node
   is large enough.
 - **Images:** `compass_dolphin_image` defaults to `latest`. After a successful

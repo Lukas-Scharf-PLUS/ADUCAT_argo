@@ -10,10 +10,27 @@
 #   /work/processed/  compass/             GSLCs (compass/gslcs) and COMPASS logs
 #                     dolphin/             dolphin's work directory
 #   /work/final/      dolphin_points.parquet
+#   /work/logs/       download-slc.log, download-orbits.log
 #
 # compass, dolphin and postprocess each upload their output folder as an output
 # artifact to <s3_output_prefix>/<workflow name>/..., so runs never overwrite
-# each other. The downloaded SLCs and orbits are not uploaded.
+# each other. The downloaded SLCs and orbits are not uploaded; only their logs are
+# (to <s3_output_prefix>/<workflow name>/logs/).
+#
+# Logs: every step runs through `bash -c '... | tee <log>'`, so the full console
+# output (stdout and stderr, including tracebacks) is written to a file as well as
+# to the Argo pod log. The first entry in `args` is that log file; the rest is the
+# command. The log files are part of the uploaded artifacts:
+#   download-slc     logs/download-slc.log
+#   download-orbits  logs/download-orbits.log
+#   compass          processed/compass/logs/run_pipeline_compass.log
+#                    (next to COMPASS's own per-job logs)
+#   dolphin          processed/dolphin/run_pipeline_dolphin.log
+#                    (next to dolphin's own dolphin.log)
+#   postprocess      final/run_postprocessing.log
+# `set -o pipefail` keeps the step's exit code, so a failing command still fails
+# the step. Argo also uploads the output artifacts of a failed step, so the logs
+# of a failed run end up in the bucket too.
 #
 # Submit with:  argo submit workflows/insar_pipeline.yaml
 # Other dates:  argo submit workflows/insar_pipeline.yaml -p start_date=... -p end_date=...
@@ -33,6 +50,12 @@ spec:
         value: "73"                    # must match slc_dir in the COMPASS config
       - name: instrument_mode
         value: IW
+      # Satellites to download: "all" or a subset such as "S1A" or "S1C S1D".
+      # S1A-S1C interferograms after 2025-05-19 show phase jumps at burst edges
+      # (S1C azimuth timing update, no ESD in COMPASS), so single-satellite
+      # stacks can be cleaner. Needs a downloader image with --platforms.
+      - name: platforms
+        value: all
       - name: start_date
         value: "2025-01-01"
       - name: end_date
@@ -56,7 +79,7 @@ spec:
 
       # --- outputs ---
       - name: s3_output_prefix
-        value: WP5_Infrastructure_and_Underground_Safety/insar_pipeline
+        value: WP5_Infrastructure_and_Underground_Safety/COMPASS-DOLPHIN
 
       # --- images ---
       # Pin sha-<commit> or version tags for reproducible runs; `latest` changes
@@ -88,12 +111,27 @@ spec:
             dependencies: [dolphin]
 
     - name: download-slc
+      outputs:
+        artifacts:
+          - name: download-slc-log
+            path: /work/logs/download-slc.log
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/logs/download-slc.log"
+            archive:
+              none: {}
       container:
         image: "{{workflow.parameters.downloader_image}}"
         # `command` replaces the image ENTRYPOINT; _entrypoint.sh activates the
-        # micromamba environment, so it has to stay in front of python.
-        command: [/usr/local/bin/_entrypoint.sh, python]
+        # micromamba environment, so it has to stay in front of bash/python.
+        # bash gets the log file as $0 and the command as "$@" (see the header).
+        command:
+          - /usr/local/bin/_entrypoint.sh
+          - bash
+          - -c
+          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" 2>&1 | tee "$0"'
         args:
+          - /work/logs/download-slc.log
+          - python
           - src/download_slc.py
           - --orbit_state
           - "{{workflow.parameters.orbit_state}}"
@@ -101,6 +139,8 @@ spec:
           - "{{workflow.parameters.relative_orbit}}"
           - --instrument_mode
           - "{{workflow.parameters.instrument_mode}}"
+          - --platforms
+          - "{{workflow.parameters.platforms}}"
           - --start_date
           - "{{workflow.parameters.start_date}}"
           - --end_date
@@ -129,10 +169,24 @@ spec:
         imagePullPolicy: IfNotPresent
 
     - name: download-orbits
+      outputs:
+        artifacts:
+          - name: download-orbits-log
+            path: /work/logs/download-orbits.log
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/logs/download-orbits.log"
+            archive:
+              none: {}
       container:
         image: "{{workflow.parameters.downloader_image}}"
-        command: [/usr/local/bin/_entrypoint.sh, python]
+        command:
+          - /usr/local/bin/_entrypoint.sh
+          - bash
+          - -c
+          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" 2>&1 | tee "$0"'
         args:
+          - /work/logs/download-orbits.log
+          - python
           - src/download_orbits.py
           - --safe_dir
           - /work/input/slc
@@ -177,15 +231,23 @@ spec:
               none: {}                 # upload the folders as they are, no .tgz
       container:
         image: "{{workflow.parameters.compass_dolphin_image}}"
-        command: [/usr/local/bin/_entrypoint.sh, python, /app/run_pipeline.py]
+        command:
+          - /usr/local/bin/_entrypoint.sh
+          - bash
+          - -c
+          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" 2>&1 | tee "$0"'
         args:
+          - /work/processed/compass/logs/run_pipeline_compass.log
+          - python
+          - /app/run_pipeline.py
           - compass
           - --compass-config
           - /work/input/config/compass.yaml
         # COMPASS runs n_workers x threads_per_worker = 2 x 4 threads (see the config).
+        # The limits are the cluster's maximum per container (15 CPUs, 56 GiB).
         resources:
           requests: {cpu: "8", memory: 32Gi}
-          limits: {cpu: "16", memory: 64Gi}
+          limits: {cpu: "15", memory: 56Gi}
         volumeMounts:
           - name: ephemeral-workdir
             mountPath: /work
@@ -212,16 +274,24 @@ spec:
               none: {}
       container:
         image: "{{workflow.parameters.compass_dolphin_image}}"
-        command: [/usr/local/bin/_entrypoint.sh, python, /app/run_pipeline.py]
+        command:
+          - /usr/local/bin/_entrypoint.sh
+          - bash
+          - -c
+          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" 2>&1 | tee "$0"'
         args:
+          - /work/processed/dolphin/run_pipeline_dolphin.log
+          - python
+          - /app/run_pipeline.py
           - dolphin
           - --dolphin-config
           - /work/input/config/dolphin.yaml
           - --gslc-dir
           - /work/processed/compass/gslcs
+        # The limits are the cluster's maximum per container (15 CPUs, 56 GiB).
         resources:
           requests: {cpu: "8", memory: 32Gi}
-          limits: {cpu: "16", memory: 64Gi}
+          limits: {cpu: "15", memory: 56Gi}
         volumeMounts:
           - name: ephemeral-workdir
             mountPath: /work
@@ -239,8 +309,15 @@ spec:
               none: {}
       container:
         image: "{{workflow.parameters.postprocessing_image}}"
-        command: [/usr/local/bin/_entrypoint.sh, python, /app/run_postprocessing.py]
+        command:
+          - /usr/local/bin/_entrypoint.sh
+          - bash
+          - -c
+          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" 2>&1 | tee "$0"'
         args:
+          - /work/final/run_postprocessing.log
+          - python
+          - /app/run_postprocessing.py
           - --dolphin-dir
           - /work/processed/dolphin
           - --output
