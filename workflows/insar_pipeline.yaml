@@ -81,15 +81,25 @@ spec:
       - name: s3_output_prefix
         value: WP5_Infrastructure_and_Underground_Safety/COMPASS-DOLPHIN
 
+      # --- post-processing ---
+      # Attribute groups or single columns to leave out of the point file,
+      # separated by spaces. Empty (default) writes all attributes.
+      # Groups: position, geometry, phase_linking, persistent_scatterers,
+      # quality_flags, dolphin_velocity, model, model_coherence, displacement,
+      # displacement_std. Example: "displacement_std persistent_scatterers row col".
+      - name: postprocess_exclude
+        value: ""
+
       # --- images ---
-      # Pin sha-<commit> or version tags for reproducible runs; `latest` changes
-      # with every push to main.
+      # `latest` follows every push to main (all steps use imagePullPolicy:
+      # Always, so a node never runs an older cached `latest`). Pin sha-<commit>
+      # or version tags instead for reproducible runs.
       - name: downloader_image
-        value: ghcr.io/lukas-scharf-plus/slc_downloader:sha-3e3f8cc
+        value: ghcr.io/lukas-scharf-plus/slc_downloader:latest
       - name: compass_dolphin_image
         value: ghcr.io/lukas-scharf-plus/compass-dolphin:latest
       - name: postprocessing_image
-        value: ghcr.io/lukas-scharf-plus/dolphin_postprocessing:sha-761fc04
+        value: ghcr.io/lukas-scharf-plus/dolphin_postprocessing:latest
 
   templates:
     - name: main
@@ -166,7 +176,7 @@ spec:
         volumeMounts:
           - name: ephemeral-workdir
             mountPath: /work
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
 
     - name: download-orbits
       outputs:
@@ -205,7 +215,7 @@ spec:
         volumeMounts:
           - name: ephemeral-workdir
             mountPath: /work
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
 
     # GSLCs from the SLCs. Argo loads the input artifacts straight into the
     # shared volume, because their paths lie under its mount point.
@@ -309,11 +319,17 @@ spec:
               none: {}
       container:
         image: "{{workflow.parameters.postprocessing_image}}"
+        # Same log wrapper as the other steps, plus `--exclude <names>` when the
+        # postprocess_exclude parameter is not empty. $EXCLUDE is left unquoted
+        # on purpose, so "a b" becomes the two arguments `--exclude a b`.
         command:
           - /usr/local/bin/_entrypoint.sh
           - bash
           - -c
-          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" 2>&1 | tee "$0"'
+          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" ${EXCLUDE:+--exclude $EXCLUDE} 2>&1 | tee "$0"'
+        env:
+          - name: EXCLUDE
+            value: "{{workflow.parameters.postprocess_exclude}}"
         args:
           - /work/final/run_postprocessing.log
           - python
@@ -328,7 +344,7 @@ spec:
         volumeMounts:
           - name: ephemeral-workdir
             mountPath: /work
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
 
   # All three images run as the non-root user "mambauser" (UID/GID 57439);
   # fsGroup makes the volume writable for that user.

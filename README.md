@@ -117,7 +117,16 @@ Other dates or parameters:
 
 ```bash
 argo submit workflows/insar_pipeline.yaml -p start_date=2024-01-01 -p end_date=2024-12-31
+
+# only S1A scenes, and a point file without the per-date standard deviations
+argo submit workflows/insar_pipeline.yaml -p platforms=S1A \
+    -p postprocess_exclude="displacement_std persistent_scatterers"
 ```
+
+- `platforms`: satellites to download, `all` (default) or e.g. `S1A`, `"S1C S1D"`.
+- `postprocess_exclude`: attribute groups or columns to leave out of the point
+  file, separated by spaces. Empty (default) writes all attributes. The groups
+  are listed in the `dolphin_postprocessing` README (`--exclude`).
 
 For a longer period, also raise the volume size (`storage` under
 `volumeClaimTemplates`, about 8 GB per SLC).
@@ -133,8 +142,9 @@ For a longer period, also raise the volume size (`storage` under
   larger limits). `n_workers × threads_per_worker` in `compass.yaml` should
   match the CPU request. Lower the requests if pods stay `Pending` because no node
   is large enough.
-- **Images:** `compass_dolphin_image` defaults to `latest`. After a successful
-  test, pin it to a `sha-<commit>` tag so results stay reproducible.
+- **Images:** all three images default to `latest`, and every step uses
+  `imagePullPolicy: Always`, so each run uses the newest image from `main`.
+  For reproducible results, pin them to `sha-<commit>` tags.
 - **Users:** all images run as the non-root user `mambauser` (UID/GID 57439); the
   workflow's `securityContext` with `fsGroup: 57439` makes the volume writable.
 - **Clean-up:** a successful workflow is deleted after 5 minutes, a failed one
