@@ -83,6 +83,22 @@ step fails:
 COMPASS's per-job logs (`processed/compass/logs/`) and dolphin's own `dolphin.log`
 (`processed/dolphin/`) are uploaded as before.
 
+**Storage report.** After every run, also a failed one, the exit handler
+`storage-report` measures the disk use of each folder on the shared volume and
+writes it to `<s3_output_prefix>/<workflow name>/logs/storage_report.txt` (and
+`.json`, also printed in the pod log):
+
+- every input folder (`slc` with the number of SAFE folders, `orbits`, `dem`,
+  `watermask`, `burst_db`, `config`),
+- `processed/compass` and `processed/dolphin` with their subfolders,
+- `final` with each file (e.g. `dolphin_points.parquet`),
+- the **peak** volume usage while compass and dolphin ran, and the volume size.
+
+The peak matters for sizing the volume: COMPASS deletes its scratch files at the
+end, so the final folder sizes alone are too small. The compass and dolphin
+wrappers sample `df /work` every 60 s in the background and keep the maximum in
+`/work/logs/peak_<step>.bytes`.
+
 COMPASS and dolphin are separate steps of the same image. If dolphin fails, the
 GSLCs have already been uploaded, and COMPASS does not have to be repeated.
 

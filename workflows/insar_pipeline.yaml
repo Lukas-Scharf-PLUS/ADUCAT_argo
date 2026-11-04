@@ -10,7 +10,12 @@
 #   /work/processed/  compass/             GSLCs (compass/gslcs) and COMPASS logs
 #                     dolphin/             dolphin's work directory
 #   /work/final/      dolphin_points.parquet
-#   /work/logs/       download-slc.log, download-orbits.log
+#   /work/logs/       download-slc.log, download-orbits.log, storage_report.txt/.json
+#
+# Storage report: the exit handler `storage-report` runs after every run (also a
+# failed one) and writes the disk use of every input, COMPASS, dolphin and final
+# folder, the peak volume usage during compass and dolphin, and the volume size to
+# <s3_output_prefix>/<workflow name>/logs/storage_report.txt (and .json).
 #
 # compass, dolphin and postprocess each upload their output folder as an output
 # artifact to <s3_output_prefix>/<workflow name>/..., so runs never overwrite
@@ -40,6 +45,8 @@ metadata:
   generateName: insar-pipeline-
 spec:
   entrypoint: main
+  # Storage report after every run, also after a failure (see storage-report).
+  onExit: storage-report
   serviceAccountName: aducat
   arguments:
     parameters:
@@ -241,11 +248,34 @@ spec:
               none: {}                 # upload the folders as they are, no .tgz
       container:
         image: "{{workflow.parameters.compass_dolphin_image}}"
+        # Log wrapper plus peak tracking: a background loop samples the volume
+        # usage every 60 s and keeps the maximum in $PEAK_FILE for the storage
+        # report (exit handler). COMPASS deletes its scratch files at the end,
+        # so the final folder sizes alone underestimate the space needed.
         command:
           - /usr/local/bin/_entrypoint.sh
           - bash
           - -c
-          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" 2>&1 | tee "$0"'
+          - |
+            set -o pipefail
+            mkdir -p "$(dirname "$0")" "$(dirname "$PEAK_FILE")"
+            ( max=0
+              # On kill, also stop the running sleep instead of leaving it behind.
+              trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+              while :; do
+                used=$(df -B1 --output=used /work | tail -n 1 | tr -d ' ')
+                if [ "$used" -gt "$max" ]; then max=$used; echo "$max" > "$PEAK_FILE"; fi
+                sleep 60 & nap=$!
+                wait "$nap"
+              done ) &
+            sampler=$!
+            "$@" 2>&1 | tee "$0"
+            status=$?
+            kill "$sampler" 2>/dev/null
+            exit "$status"
+        env:
+          - name: PEAK_FILE
+            value: /work/logs/peak_compass.bytes
         args:
           - /work/processed/compass/logs/run_pipeline_compass.log
           - python
@@ -284,11 +314,31 @@ spec:
               none: {}
       container:
         image: "{{workflow.parameters.compass_dolphin_image}}"
+        # Same wrapper with peak tracking as the compass step.
         command:
           - /usr/local/bin/_entrypoint.sh
           - bash
           - -c
-          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" 2>&1 | tee "$0"'
+          - |
+            set -o pipefail
+            mkdir -p "$(dirname "$0")" "$(dirname "$PEAK_FILE")"
+            ( max=0
+              # On kill, also stop the running sleep instead of leaving it behind.
+              trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+              while :; do
+                used=$(df -B1 --output=used /work | tail -n 1 | tr -d ' ')
+                if [ "$used" -gt "$max" ]; then max=$used; echo "$max" > "$PEAK_FILE"; fi
+                sleep 60 & nap=$!
+                wait "$nap"
+              done ) &
+            sampler=$!
+            "$@" 2>&1 | tee "$0"
+            status=$?
+            kill "$sampler" 2>/dev/null
+            exit "$status"
+        env:
+          - name: PEAK_FILE
+            value: /work/logs/peak_dolphin.bytes
         args:
           - /work/processed/dolphin/run_pipeline_dolphin.log
           - python
@@ -341,6 +391,132 @@ spec:
         resources:
           requests: {cpu: "2", memory: 8Gi}
           limits: {cpu: "4", memory: 16Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: Always
+
+    # Exit handler (spec.onExit): runs after the DAG, also when a step failed.
+    # Measures the disk use of every folder on the shared volume and writes
+    # logs/storage_report.txt and .json (also printed to the pod log).
+    # Uses the downloader image only because it has Python, du and df.
+    - name: storage-report
+      outputs:
+        artifacts:
+          - name: storage-report-txt
+            path: /work/logs/storage_report.txt
+            optional: true
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/logs/storage_report.txt"
+            archive:
+              none: {}
+          - name: storage-report-json
+            path: /work/logs/storage_report.json
+            optional: true
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/logs/storage_report.json"
+            archive:
+              none: {}
+      script:
+        image: "{{workflow.parameters.downloader_image}}"
+        command: [/usr/local/bin/_entrypoint.sh, python]
+        env:
+          - name: WORKFLOW_NAME
+            value: "{{workflow.name}}"
+          - name: WORKFLOW_STATUS
+            value: "{{workflow.status}}"
+        source: |
+          """Storage report: disk use of the inputs, COMPASS, dolphin and the final output."""
+          import datetime
+          import json
+          import os
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          WORK = Path("/work")
+          LOG_DIR = WORK / "logs"
+          BYTES_PER_GB = 1e9
+          INPUT_FOLDERS = ("slc", "orbits", "dem", "watermask", "burst_db", "config")
+          PEAK_STEPS = ("compass", "dolphin")
+
+
+          def disk_use(path):
+              """Bytes used by a file or folder (du), or None if it does not exist."""
+              if not path.exists():
+                  return None
+              result = subprocess.run(["du", "-sb", str(path)], capture_output=True, text=True)
+              return int(result.stdout.split()[0]) if result.stdout else None
+
+
+          def read_peak(step):
+              """Peak volume usage recorded by a step's wrapper, or None."""
+              try:
+                  return int((LOG_DIR / f"peak_{step}.bytes").read_text().strip())
+              except (OSError, ValueError):
+                  return None
+
+
+          def children(path, want_dirs):
+              """Sorted subfolders (want_dirs=True) or files of a folder."""
+              if not path.is_dir():
+                  return []
+              return sorted(p for p in path.iterdir() if p.is_dir() == want_dirs)
+
+
+          def gb(value):
+              return "-" if value is None else f"{value / BYTES_PER_GB:9.2f} GB"
+
+
+          # (key in the JSON, label in the text report, path, note)
+          entries = []
+          slc_dir = WORK / "input" / "slc"
+          safe_count = len(list(slc_dir.glob("*.SAFE"))) + len(list(slc_dir.glob("*/*.SAFE")))
+          for name in INPUT_FOLDERS:
+              note = f"{safe_count} SAFE" if name == "slc" else ""
+              entries.append((f"input/{name}", f"input/{name}", WORK / "input" / name, note))
+          for step in ("compass", "dolphin"):
+              step_dir = WORK / "processed" / step
+              entries.append((f"processed/{step}", f"processed/{step}", step_dir, ""))
+              for sub in children(step_dir, want_dirs=True):
+                  entries.append((f"processed/{step}/{sub.name}", f"  {sub.name}", sub, ""))
+          entries.append(("final", "final", WORK / "final", ""))
+          for file in children(WORK / "final", want_dirs=False):
+              entries.append((f"final/{file.name}", f"  {file.name}", file, ""))
+
+          sizes = {key: disk_use(path) for key, _, path, _ in entries}
+          peaks = {step: read_peak(step) for step in PEAK_STEPS}
+          volume = shutil.disk_usage(WORK)
+          now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          workflow = os.environ.get("WORKFLOW_NAME", "")
+          status = os.environ.get("WORKFLOW_STATUS", "")
+
+          lines = [f"Storage report  {workflow}  status: {status}  ({now})", ""]
+          for key, label, _, note in entries:
+              lines.append(f"{label:<34}{gb(sizes[key])}   {note}".rstrip())
+          lines += ["", "Peak volume usage while the step ran (sampled every 60 s):"]
+          for step in PEAK_STEPS:
+              lines.append(f"  {step:<32}{gb(peaks[step])}")
+          lines += [
+              "",
+              f"{'volume used / size':<34}{gb(volume.used)} / {volume.total / BYTES_PER_GB:.0f} GB",
+          ]
+          report = "\n".join(lines)
+          print(report)
+
+          LOG_DIR.mkdir(parents=True, exist_ok=True)
+          (LOG_DIR / "storage_report.txt").write_text(report + "\n")
+          (LOG_DIR / "storage_report.json").write_text(json.dumps({
+              "workflow": workflow,
+              "status": status,
+              "created_utc": now,
+              "sizes_bytes": sizes,
+              "peak_volume_used_bytes": peaks,
+              "volume_bytes": {"used": volume.used, "total": volume.total},
+          }, indent=2) + "\n")
+        resources:
+          requests: {cpu: "1", memory: 1Gi}
+          limits: {cpu: "2", memory: 2Gi}
         volumeMounts:
           - name: ephemeral-workdir
             mountPath: /work
