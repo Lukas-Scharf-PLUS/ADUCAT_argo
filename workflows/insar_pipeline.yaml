@@ -9,7 +9,8 @@
 #                     burst_db/, config/
 #   /work/processed/  compass/             GSLCs (compass/gslcs) and COMPASS logs
 #                     dolphin/             dolphin's work directory
-#   /work/final/      dolphin_points.parquet
+#   /work/final/      S1_ASC_073_IW1-IW2_VV_<first>_<last>_<area_name>.parquet
+#                     and .metadata.json (name built from the data)
 #   /work/logs/       download-slc.log, download-orbits.log, storage_report.txt/.json
 #
 # Storage report: the exit handler `storage-report` runs after every run (also a
@@ -89,6 +90,10 @@ spec:
         value: WP5_Infrastructure_and_Underground_Safety/COMPASS-DOLPHIN
 
       # --- post-processing ---
+      # Area name, added to the point file name and its metadata
+      # (letters, digits and hyphens; other characters become "-"). Empty: no area name.
+      - name: area_name
+        value: vienna
       # Attribute groups or single columns to leave out of the point file,
       # separated by spaces. Empty (default) writes all attributes.
       # Groups: position, geometry, phase_linking, persistent_scatterers,
@@ -380,14 +385,33 @@ spec:
         env:
           - name: EXCLUDE
             value: "{{workflow.parameters.postprocess_exclude}}"
+          # Variables starting with INSAR_RUN_ are stored in the "run" section of
+          # the point file's metadata (e.g. INSAR_RUN_WORKFLOW_NAME -> workflow_name),
+          # so every file says which workflow, request and images produced it.
+          - name: INSAR_RUN_WORKFLOW_NAME
+            value: "{{workflow.name}}"
+          - name: INSAR_RUN_REQUESTED_START_DATE
+            value: "{{workflow.parameters.start_date}}"
+          - name: INSAR_RUN_REQUESTED_END_DATE
+            value: "{{workflow.parameters.end_date}}"
+          - name: INSAR_RUN_PLATFORMS
+            value: "{{workflow.parameters.platforms}}"
+          - name: INSAR_RUN_DOWNLOADER_IMAGE
+            value: "{{workflow.parameters.downloader_image}}"
+          - name: INSAR_RUN_COMPASS_DOLPHIN_IMAGE
+            value: "{{workflow.parameters.compass_dolphin_image}}"
+          - name: INSAR_RUN_POSTPROCESSING_IMAGE
+            value: "{{workflow.parameters.postprocessing_image}}"
         args:
           - /work/final/run_postprocessing.log
           - python
           - /app/run_postprocessing.py
           - --dolphin-dir
           - /work/processed/dolphin
-          - --output
-          - /work/final/dolphin_points.parquet
+          - --output-dir
+          - /work/final
+          - --area-name
+          - "{{workflow.parameters.area_name}}"
         resources:
           requests: {cpu: "2", memory: 8Gi}
           limits: {cpu: "4", memory: 16Gi}

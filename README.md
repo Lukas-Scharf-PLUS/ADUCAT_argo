@@ -49,8 +49,16 @@ the previous ones:
 │   ├── compass/          gslcs/ and logs/         -> output artifact
 │   └── dolphin/          dolphin's work directory -> output artifact
 └── final/
-    └── dolphin_points.parquet                     -> output artifact
+    ├── S1_ASC_073_IW1-IW2_VV_<first>_<last>_<area_name>.parquet  -> output artifact
+    └── S1_ASC_073_IW1-IW2_VV_<first>_<last>_<area_name>.metadata.json
 ```
+
+The point file is named after its content (direction, track, subswaths,
+polarization, first and last acquisition, the `area_name` parameter) and
+contains the processing metadata: software versions, the SLC and orbit files
+used, the full dolphin config, and the run details passed as `INSAR_RUN_*`
+variables (workflow name, requested dates, platforms, image names). See the
+dolphin_postprocessing README, "Output file name and metadata".
 
 **Inputs** are files in the artifact bucket. Their keys are workflow parameters
 (`dem_key`, `watermask_key`, `burst_db_key`, `compass_config_key`,
@@ -62,7 +70,7 @@ the previous ones:
 ```
 <s3_output_prefix>/<workflow name>/processed/compass
 <s3_output_prefix>/<workflow name>/processed/dolphin
-<s3_output_prefix>/<workflow name>/final/dolphin_points.parquet
+<s3_output_prefix>/<workflow name>/final/S1_..._<area_name>.parquet (and .metadata.json)
 ```
 
 The workflow name (e.g. `insar-pipeline-x7k2p`) is unique per run, so runs never
@@ -91,7 +99,7 @@ writes it to `<s3_output_prefix>/<workflow name>/logs/storage_report.txt` (and
 - every input folder (`slc` with the number of SAFE folders, `orbits`, `dem`,
   `watermask`, `burst_db`, `config`),
 - `processed/compass` and `processed/dolphin` with their subfolders,
-- `final` with each file (e.g. `dolphin_points.parquet`),
+- `final` with each file (the `.parquet`, its `.metadata.json` and the log),
 - the **peak** volume usage while compass and dolphin ran, and the volume size.
 
 The peak matters for sizing the volume: COMPASS deletes its scratch files at the
@@ -143,6 +151,8 @@ argo submit workflows/insar_pipeline.yaml -p platforms=S1A \
 - `postprocess_exclude`: attribute groups or columns to leave out of the point
   file, separated by spaces. Empty (default) writes all attributes. The groups
   are listed in the `dolphin_postprocessing` README (`--exclude`).
+- `area_name`: name of the area in the point file name and metadata (default
+  `vienna`). Empty leaves it out of the name.
 
 For a longer period, also raise the volume size (`storage` under
 `volumeClaimTemplates`, about 8 GB per SLC).
