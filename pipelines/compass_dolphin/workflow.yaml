@@ -1,0 +1,589 @@
+# Argo workflow: the full InSAR chain from Sentinel-1 download to point file.
+#
+#   download-slc -> download-orbits -> compass -> dolphin -> postprocess
+#
+# All steps share one volume (ephemeral-workdir, mounted at /work):
+#
+#   /work/input/      slc/, orbits/        downloaded by the first two steps
+#                     dem/, watermask/,    loaded from the bucket as input artifacts
+#                     burst_db/, config/
+#   /work/processed/  compass/             GSLCs (compass/gslcs) and COMPASS logs
+#                     dolphin/             dolphin's work directory
+#   /work/final/      S1_ASC_073_IW1-IW2_VV_<first>_<last>_<area_name>.parquet
+#                     and .metadata.json (name built from the data)
+#   /work/logs/       download-slc.log, download-orbits.log, storage_report.txt/.json
+#
+# Storage report: the exit handler `storage-report` runs after every run (also a
+# failed one) and writes the disk use of every input, COMPASS, dolphin and final
+# folder, the peak volume usage during compass and dolphin, and the volume size to
+# <s3_output_prefix>/<workflow name>/logs/storage_report.txt (and .json).
+#
+# compass, dolphin and postprocess each upload their output folder as an output
+# artifact to <s3_output_prefix>/<workflow name>/..., so runs never overwrite
+# each other. The downloaded SLCs and orbits are not uploaded; only their logs are
+# (to <s3_output_prefix>/<workflow name>/logs/).
+#
+# Logs: every step runs through `bash -c '... | tee <log>'`, so the full console
+# output (stdout and stderr, including tracebacks) is written to a file as well as
+# to the Argo pod log. The first entry in `args` is that log file; the rest is the
+# command. The log files are part of the uploaded artifacts:
+#   download-slc     logs/download-slc.log
+#   download-orbits  logs/download-orbits.log
+#   compass          processed/compass/logs/run_pipeline_compass.log
+#                    (next to COMPASS's own per-job logs)
+#   dolphin          processed/dolphin/run_pipeline_dolphin.log
+#                    (next to dolphin's own dolphin.log)
+#   postprocess      final/run_postprocessing.log
+# `set -o pipefail` keeps the step's exit code, so a failing command still fails
+# the step. Argo also uploads the output artifacts of a failed step, so the logs
+# of a failed run end up in the bucket too.
+#
+# Submit with:  argo submit pipelines/compass_dolphin/workflow.yaml
+# Other dates:  argo submit pipelines/compass_dolphin/workflow.yaml -p start_date=... -p end_date=...
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: insar-pipeline-
+spec:
+  entrypoint: main
+  # Storage report after every run, also after a failure (see storage-report).
+  onExit: storage-report
+  serviceAccountName: aducat
+  arguments:
+    parameters:
+      # --- SLC search (slc-downloader) ---
+      - name: orbit_state
+        value: ascending
+      - name: relative_orbit
+        value: "73"                    # must match slc_dir in the COMPASS config
+      - name: instrument_mode
+        value: IW
+      # Satellites to download: "all" or a subset such as "S1A" or "S1C S1D".
+      # S1A-S1C interferograms after 2025-05-19 show phase jumps at burst edges
+      # (S1C azimuth timing update, no ESD in COMPASS), so single-satellite
+      # stacks can be cleaner. Needs a downloader image with --platforms.
+      - name: platforms
+        value: all
+      - name: start_date
+        value: "2025-01-01"
+      - name: end_date
+        value: "2025-02-28"            # inclusive; a 2-month test stack
+      - name: slc_bbox
+        value: 16.18 48.11 16.59 48.33 # WEST SOUTH EAST NORTH, covers the dolphin bounds
+      - name: slc_max_threads
+        value: "4"                     # CDSE allows 4 connections per user
+
+      # --- inputs from the bucket (keys in the artifact repository bucket) ---
+      - name: dem_key
+        value: WP5_Infrastructure_and_Underground_Safety/DEM/cop_dem.tif
+      - name: watermask_key
+        value: WP5_Infrastructure_and_Underground_Safety/Watermask/watermask.tif
+      - name: burst_db_key
+        value: WP5_Infrastructure_and_Underground_Safety/s1-burst-db/opera-burst-bbox-only.sqlite3
+      - name: compass_config_key
+        value: WP5_Infrastructure_and_Underground_Safety/argo_configs/compass_dolphin/ASC_073/compass.yaml
+      - name: dolphin_config_key
+        value: WP5_Infrastructure_and_Underground_Safety/argo_configs/compass_dolphin/ASC_073/dolphin.yaml
+
+      # --- outputs ---
+      - name: s3_output_prefix
+        value: WP5_Infrastructure_and_Underground_Safety/COMPASS-DOLPHIN
+
+      # --- post-processing ---
+      # Area name, added to the point file name and its metadata
+      # (letters, digits and hyphens; other characters become "-"). Empty: no area name.
+      - name: area_name
+        value: vienna
+      # Attribute groups or single columns to leave out of the point file,
+      # separated by spaces. Empty (default) writes all attributes.
+      # Groups: position, geometry, phase_linking, persistent_scatterers,
+      # quality_flags, dolphin_velocity, model, model_coherence, displacement,
+      # displacement_std. Example: "displacement_std persistent_scatterers row col".
+      - name: postprocess_exclude
+        value: ""
+
+      # --- images ---
+      # `latest` follows every push to main (all steps use imagePullPolicy:
+      # Always, so a node never runs an older cached `latest`). Pin sha-<commit>
+      # or version tags instead for reproducible runs.
+      - name: downloader_image
+        value: ghcr.io/lukas-scharf-plus/slc_downloader:latest
+      - name: compass_dolphin_image
+        value: ghcr.io/lukas-scharf-plus/compass-dolphin:latest
+      - name: postprocessing_image
+        value: ghcr.io/lukas-scharf-plus/dolphin_postprocessing:latest
+
+  templates:
+    - name: main
+      dag:
+        tasks:
+          - name: download-slc
+            template: download-slc
+          - name: download-orbits
+            template: download-orbits
+            dependencies: [download-slc]
+          - name: compass
+            template: compass
+            dependencies: [download-orbits]
+          - name: dolphin
+            template: dolphin
+            dependencies: [compass]
+          - name: postprocess
+            template: postprocess
+            dependencies: [dolphin]
+
+    - name: download-slc
+      outputs:
+        artifacts:
+          - name: download-slc-log
+            path: /work/logs/download-slc.log
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/logs/download-slc.log"
+            archive:
+              none: {}
+      container:
+        image: "{{workflow.parameters.downloader_image}}"
+        # `command` replaces the image ENTRYPOINT; _entrypoint.sh activates the
+        # micromamba environment, so it has to stay in front of bash/python.
+        # bash gets the log file as $0 and the command as "$@" (see the header).
+        command:
+          - /usr/local/bin/_entrypoint.sh
+          - bash
+          - -c
+          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" 2>&1 | tee "$0"'
+        args:
+          - /work/logs/download-slc.log
+          - python
+          - src/download_slc.py
+          - --orbit_state
+          - "{{workflow.parameters.orbit_state}}"
+          - --relative_orbit
+          - "{{workflow.parameters.relative_orbit}}"
+          - --instrument_mode
+          - "{{workflow.parameters.instrument_mode}}"
+          - --platforms
+          - "{{workflow.parameters.platforms}}"
+          - --start_date
+          - "{{workflow.parameters.start_date}}"
+          - --end_date
+          - "{{workflow.parameters.end_date}}"
+          - --bbox
+          - "{{workflow.parameters.slc_bbox}}"
+          - --max_threads
+          - "{{workflow.parameters.slc_max_threads}}"
+          - --threads_per_file
+          - "1"
+          - --base_path
+          - /work/input/slc
+        env:
+          - name: cdse_S3_KEY
+            valueFrom:
+              secretKeyRef: {name: cdse, key: S3_KEY}
+          - name: cdse_S3_SECRET
+            valueFrom:
+              secretKeyRef: {name: cdse, key: S3_SECRET}
+        resources:
+          requests: {cpu: "2", memory: 4Gi}
+          limits: {cpu: "4", memory: 8Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: Always
+
+    - name: download-orbits
+      outputs:
+        artifacts:
+          - name: download-orbits-log
+            path: /work/logs/download-orbits.log
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/logs/download-orbits.log"
+            archive:
+              none: {}
+      container:
+        image: "{{workflow.parameters.downloader_image}}"
+        command:
+          - /usr/local/bin/_entrypoint.sh
+          - bash
+          - -c
+          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" 2>&1 | tee "$0"'
+        args:
+          - /work/logs/download-orbits.log
+          - python
+          - src/download_orbits.py
+          - --safe_dir
+          - /work/input/slc
+          - --orbit_dir
+          - /work/input/orbits
+        env:
+          - name: cdse_S3_KEY
+            valueFrom:
+              secretKeyRef: {name: cdse, key: S3_KEY}
+          - name: cdse_S3_SECRET
+            valueFrom:
+              secretKeyRef: {name: cdse, key: S3_SECRET}
+        resources:
+          requests: {cpu: "1", memory: 1Gi}
+          limits: {cpu: "2", memory: 2Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: Always
+
+    # GSLCs from the SLCs. Argo loads the input artifacts straight into the
+    # shared volume, because their paths lie under its mount point.
+    - name: compass
+      inputs:
+        artifacts:
+          - name: dem
+            path: /work/input/dem/cop_dem.tif
+            s3: {key: "{{workflow.parameters.dem_key}}"}
+          - name: burst-db
+            path: /work/input/burst_db/opera-burst-bbox-only.sqlite3
+            s3: {key: "{{workflow.parameters.burst_db_key}}"}
+          - name: compass-config
+            path: /work/input/config/compass.yaml
+            s3: {key: "{{workflow.parameters.compass_config_key}}"}
+      outputs:
+        artifacts:
+          - name: compass
+            path: /work/processed/compass
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/processed/compass"
+            archive:
+              none: {}                 # upload the folders as they are, no .tgz
+      container:
+        image: "{{workflow.parameters.compass_dolphin_image}}"
+        # Log wrapper plus peak tracking: a background loop samples the volume
+        # usage every 60 s and keeps the maximum in $PEAK_FILE for the storage
+        # report (exit handler). COMPASS deletes its scratch files at the end,
+        # so the final folder sizes alone underestimate the space needed.
+        command:
+          - /usr/local/bin/_entrypoint.sh
+          - bash
+          - -c
+          - |
+            set -o pipefail
+            mkdir -p "$(dirname "$0")" "$(dirname "$PEAK_FILE")"
+            ( max=0
+              # On kill, also stop the running sleep instead of leaving it behind.
+              trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+              while :; do
+                used=$(df -B1 --output=used /work | tail -n 1 | tr -d ' ')
+                if [ "$used" -gt "$max" ]; then max=$used; echo "$max" > "$PEAK_FILE"; fi
+                sleep 60 & nap=$!
+                wait "$nap"
+              done ) &
+            sampler=$!
+            "$@" 2>&1 | tee "$0"
+            status=$?
+            kill "$sampler" 2>/dev/null
+            exit "$status"
+        env:
+          - name: PEAK_FILE
+            value: /work/logs/peak_compass.bytes
+        args:
+          - /work/processed/compass/logs/run_pipeline_compass.log
+          - python
+          - /app/run_pipeline.py
+          - compass
+          - --compass-config
+          - /work/input/config/compass.yaml
+        # COMPASS runs n_workers x threads_per_worker = 2 x 4 threads (see the config).
+        # The limits are the cluster's maximum per container (15 CPUs, 56 GiB).
+        resources:
+          requests: {cpu: "8", memory: 32Gi}
+          limits: {cpu: "15", memory: 56Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: Always
+
+    # Displacement time series from the GSLCs. Also stitches the static layers
+    # to /work/processed/dolphin/geometry, using the DEM loaded by the compass step.
+    - name: dolphin
+      inputs:
+        artifacts:
+          - name: watermask
+            path: /work/input/watermask/watermask.tif
+            s3: {key: "{{workflow.parameters.watermask_key}}"}
+          - name: dolphin-config
+            path: /work/input/config/dolphin.yaml
+            s3: {key: "{{workflow.parameters.dolphin_config_key}}"}
+      outputs:
+        artifacts:
+          - name: dolphin
+            path: /work/processed/dolphin
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/processed/dolphin"
+            archive:
+              none: {}
+      container:
+        image: "{{workflow.parameters.compass_dolphin_image}}"
+        # Same wrapper with peak tracking as the compass step.
+        command:
+          - /usr/local/bin/_entrypoint.sh
+          - bash
+          - -c
+          - |
+            set -o pipefail
+            mkdir -p "$(dirname "$0")" "$(dirname "$PEAK_FILE")"
+            ( max=0
+              # On kill, also stop the running sleep instead of leaving it behind.
+              trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+              while :; do
+                used=$(df -B1 --output=used /work | tail -n 1 | tr -d ' ')
+                if [ "$used" -gt "$max" ]; then max=$used; echo "$max" > "$PEAK_FILE"; fi
+                sleep 60 & nap=$!
+                wait "$nap"
+              done ) &
+            sampler=$!
+            "$@" 2>&1 | tee "$0"
+            status=$?
+            kill "$sampler" 2>/dev/null
+            exit "$status"
+        env:
+          - name: PEAK_FILE
+            value: /work/logs/peak_dolphin.bytes
+        args:
+          - /work/processed/dolphin/run_pipeline_dolphin.log
+          - python
+          - /app/run_pipeline.py
+          - dolphin
+          - --dolphin-config
+          - /work/input/config/dolphin.yaml
+          - --gslc-dir
+          - /work/processed/compass/gslcs
+        # The limits are the cluster's maximum per container (15 CPUs, 56 GiB).
+        resources:
+          requests: {cpu: "8", memory: 32Gi}
+          limits: {cpu: "15", memory: 56Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: Always
+
+    # One GeoParquet point file with EGMS-style model parameters.
+    - name: postprocess
+      outputs:
+        artifacts:
+          - name: points
+            path: /work/final
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/final"
+            archive:
+              none: {}
+      container:
+        image: "{{workflow.parameters.postprocessing_image}}"
+        # Same log wrapper as the other steps, plus `--exclude <names>` when the
+        # postprocess_exclude parameter is not empty. $EXCLUDE is left unquoted
+        # on purpose, so "a b" becomes the two arguments `--exclude a b`.
+        command:
+          - /usr/local/bin/_entrypoint.sh
+          - bash
+          - -c
+          - 'set -o pipefail; mkdir -p "$(dirname "$0")"; "$@" ${EXCLUDE:+--exclude $EXCLUDE} 2>&1 | tee "$0"'
+        env:
+          - name: EXCLUDE
+            value: "{{workflow.parameters.postprocess_exclude}}"
+          # Variables starting with INSAR_RUN_ are stored in the "run" section of
+          # the point file's metadata (e.g. INSAR_RUN_WORKFLOW_NAME -> workflow_name),
+          # so every file says which workflow, request and images produced it.
+          - name: INSAR_RUN_WORKFLOW_NAME
+            value: "{{workflow.name}}"
+          - name: INSAR_RUN_REQUESTED_START_DATE
+            value: "{{workflow.parameters.start_date}}"
+          - name: INSAR_RUN_REQUESTED_END_DATE
+            value: "{{workflow.parameters.end_date}}"
+          - name: INSAR_RUN_PLATFORMS
+            value: "{{workflow.parameters.platforms}}"
+          - name: INSAR_RUN_DOWNLOADER_IMAGE
+            value: "{{workflow.parameters.downloader_image}}"
+          - name: INSAR_RUN_COMPASS_DOLPHIN_IMAGE
+            value: "{{workflow.parameters.compass_dolphin_image}}"
+          - name: INSAR_RUN_POSTPROCESSING_IMAGE
+            value: "{{workflow.parameters.postprocessing_image}}"
+        args:
+          - /work/final/run_postprocessing.log
+          - python
+          - /app/run_postprocessing.py
+          - --dolphin-dir
+          - /work/processed/dolphin
+          - --output-dir
+          - /work/final
+          - --area-name
+          - "{{workflow.parameters.area_name}}"
+        resources:
+          requests: {cpu: "2", memory: 8Gi}
+          limits: {cpu: "4", memory: 16Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: Always
+
+    # Exit handler (spec.onExit): runs after the DAG, also when a step failed.
+    # Measures the disk use of every folder on the shared volume and writes
+    # logs/storage_report.txt and .json (also printed to the pod log).
+    # Uses the downloader image only because it has Python, du and df.
+    - name: storage-report
+      outputs:
+        artifacts:
+          - name: storage-report-txt
+            path: /work/logs/storage_report.txt
+            optional: true
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/logs/storage_report.txt"
+            archive:
+              none: {}
+          - name: storage-report-json
+            path: /work/logs/storage_report.json
+            optional: true
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/logs/storage_report.json"
+            archive:
+              none: {}
+      script:
+        image: "{{workflow.parameters.downloader_image}}"
+        command: [/usr/local/bin/_entrypoint.sh, python]
+        env:
+          - name: WORKFLOW_NAME
+            value: "{{workflow.name}}"
+          - name: WORKFLOW_STATUS
+            value: "{{workflow.status}}"
+        source: |
+          """Storage report: disk use of the inputs, COMPASS, dolphin and the final output."""
+          import datetime
+          import json
+          import os
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          WORK = Path("/work")
+          LOG_DIR = WORK / "logs"
+          BYTES_PER_GB = 1e9
+          INPUT_FOLDERS = ("slc", "orbits", "dem", "watermask", "burst_db", "config")
+          PEAK_STEPS = ("compass", "dolphin")
+
+
+          def disk_use(path):
+              """Bytes used by a file or folder (du), or None if it does not exist."""
+              if not path.exists():
+                  return None
+              result = subprocess.run(["du", "-sb", str(path)], capture_output=True, text=True)
+              return int(result.stdout.split()[0]) if result.stdout else None
+
+
+          def read_peak(step):
+              """Peak volume usage recorded by a step's wrapper, or None."""
+              try:
+                  return int((LOG_DIR / f"peak_{step}.bytes").read_text().strip())
+              except (OSError, ValueError):
+                  return None
+
+
+          def children(path, want_dirs):
+              """Sorted subfolders (want_dirs=True) or files of a folder."""
+              if not path.is_dir():
+                  return []
+              return sorted(p for p in path.iterdir() if p.is_dir() == want_dirs)
+
+
+          def gb(value):
+              return "-" if value is None else f"{value / BYTES_PER_GB:9.2f} GB"
+
+
+          # (key in the JSON, label in the text report, path, note)
+          entries = []
+          slc_dir = WORK / "input" / "slc"
+          safe_count = len(list(slc_dir.glob("*.SAFE"))) + len(list(slc_dir.glob("*/*.SAFE")))
+          for name in INPUT_FOLDERS:
+              note = f"{safe_count} SAFE" if name == "slc" else ""
+              entries.append((f"input/{name}", f"input/{name}", WORK / "input" / name, note))
+          for step in ("compass", "dolphin"):
+              step_dir = WORK / "processed" / step
+              entries.append((f"processed/{step}", f"processed/{step}", step_dir, ""))
+              for sub in children(step_dir, want_dirs=True):
+                  entries.append((f"processed/{step}/{sub.name}", f"  {sub.name}", sub, ""))
+          entries.append(("final", "final", WORK / "final", ""))
+          for file in children(WORK / "final", want_dirs=False):
+              entries.append((f"final/{file.name}", f"  {file.name}", file, ""))
+
+          sizes = {key: disk_use(path) for key, _, path, _ in entries}
+          peaks = {step: read_peak(step) for step in PEAK_STEPS}
+          volume = shutil.disk_usage(WORK)
+          now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          workflow = os.environ.get("WORKFLOW_NAME", "")
+          status = os.environ.get("WORKFLOW_STATUS", "")
+
+          lines = [f"Storage report  {workflow}  status: {status}  ({now})", ""]
+          for key, label, _, note in entries:
+              lines.append(f"{label:<34}{gb(sizes[key])}   {note}".rstrip())
+          lines += ["", "Peak volume usage while the step ran (sampled every 60 s):"]
+          for step in PEAK_STEPS:
+              lines.append(f"  {step:<32}{gb(peaks[step])}")
+          lines += [
+              "",
+              f"{'volume used / size':<34}{gb(volume.used)} / {volume.total / BYTES_PER_GB:.0f} GB",
+          ]
+          report = "\n".join(lines)
+          print(report)
+
+          LOG_DIR.mkdir(parents=True, exist_ok=True)
+          (LOG_DIR / "storage_report.txt").write_text(report + "\n")
+          (LOG_DIR / "storage_report.json").write_text(json.dumps({
+              "workflow": workflow,
+              "status": status,
+              "created_utc": now,
+              "sizes_bytes": sizes,
+              "peak_volume_used_bytes": peaks,
+              "volume_bytes": {"used": volume.used, "total": volume.total},
+          }, indent=2) + "\n")
+        resources:
+          requests: {cpu: "1", memory: 1Gi}
+          limits: {cpu: "2", memory: 2Gi}
+        volumeMounts:
+          - name: ephemeral-workdir
+            mountPath: /work
+        imagePullPolicy: Always
+
+  # All three images run as the non-root user "mambauser" (UID/GID 57439);
+  # fsGroup makes the volume writable for that user.
+  securityContext:
+    runAsUser: 57439
+    runAsGroup: 57439
+    fsGroup: 57439
+    runAsNonRoot: true
+
+  volumeClaimTemplates:
+    - metadata:
+        name: ephemeral-workdir
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            # ~8 GB per IW SLC (2 months of track 73 is about 5-10 scenes),
+            # plus GSLCs and dolphin output. Raise for longer periods.
+            storage: 150Gi
+        storageClassName: csi-disk
+
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node_group
+                operator: In
+                values: [usera]
+  tolerations:
+    - key: hub.jupyter.org_dedicated
+      operator: Equal
+      value: usera
+      effect: NoSchedule
+
+  # Delete the workflow 5 minutes after success; keep a failed one for 2 hours
+  # so its logs can be inspected.
+  ttlStrategy:
+    secondsAfterSuccess: 300
+    secondsAfterFailure: 7200
+  podGC:
+    strategy: OnWorkflowSuccess

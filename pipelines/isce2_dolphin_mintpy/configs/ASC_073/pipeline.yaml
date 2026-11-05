@@ -1,0 +1,67 @@
+# isce2-dolphin-mintpy config for the Argo pipeline: Vienna, ascending track 73.
+#
+# Every path is a path inside the containers. The workflow loads the inputs to
+# these paths and all steps share the volume mounted at /work.
+# Upload this file to the bucket at the key given by the workflow parameter
+# `pipeline_config_key`. All options are explained in
+# isce2-dolphin-minpty/config/example.yaml.
+
+paths:
+  # The SLC download step writes to /work/input/slc/S1_<track>_<ASC|DES>/.
+  slc_dir: /work/input/slc/S1_073_ASC
+  orbit_dir: /work/input/orbits
+  # Same DEM as the compass-dolphin pipeline. cop_dem.tif already contains
+  # WGS84 ELLIPSOID heights (checked: 221.5 m at Stephansdom = Copernicus EGM2008
+  # height + 44.7 m geoid). Do NOT set egm2008 here, that would add 45 m twice.
+  dem_file: /work/input/dem/cop_dem.tif
+  dem_vertical_datum: ellipsoid
+  # ISCE2, crop, dolphin and MintPy write below this folder; the postprocess
+  # step reads it as its --run-dir.
+  work_dir: /work/processed
+
+aoi:
+  # Same area as the dolphin bounds of the compass-dolphin pipeline
+  # [south, north, west, east]. ISCE2 processes all bursts overlapping it.
+  bbox: [48.11744, 48.32431, 16.18100, 16.58759]
+  buffer_m: 500
+
+water_mask:
+  # Same water mask as the compass-dolphin pipeline (1 = land, 0 = water).
+  file: /work/input/watermask/watermask.tif
+  water_value: 0
+  max_water_fraction: 0.8
+  use_in_dolphin: true
+
+isce:
+  reference_date: null           # null: first date of the stack
+  polarization: vv
+  coregistration: NESD
+  # num_proc commands of a run file in parallel, each with omp_threads threads;
+  # num_proc x omp_threads should match the CPU request of the isce step (8).
+  num_proc: 4
+  num_proc4topo: 4
+  omp_threads: 2
+
+dolphin:
+  strides_x: 4                   # about 15 m x 14 m output pixels
+  strides_y: 1
+  half_window_x: 11
+  half_window_y: 5
+  ministack_size: 15
+  max_bandwidth: 3
+  unwrap_method: snaphu
+  snaphu_ntiles: [2, 2]          # the whole of Vienna unwraps faster in tiles
+  threads_per_worker: 8          # CPU request of the dolphin step
+  n_parallel_unwrap: 4
+
+mintpy:
+  inversion: mintpy
+  min_temporal_coherence: 0.7
+  dolphin_temporal_coherence_threshold: 0.6
+  unwrap_error_correction: "no"
+  # ERA5 tropospheric correction. The workflow writes the CDS credentials from the
+  # Kubernetes secret `cds` (CDS_URL, CDS_KEY). Without that secret, set "no".
+  troposphere: pyaps
+  topographic_residual: true
+  deramp: "no"
+  geocode: true
