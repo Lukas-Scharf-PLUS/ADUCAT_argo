@@ -8,7 +8,7 @@ and runs from its published image:
 | --- | --- | --- |
 | Download SLCs and orbits | `SLC_downloader` | `ghcr.io/lukas-scharf-plus/slc_downloader` |
 | ISCE2, crop, dolphin, MintPy | `isce2-dolphin-minpty` (GitHub: `isce2-dolphin-mintpy`) | `ghcr.io/lukas-scharf-plus/isce2-dolphin-mintpy` |
-| Point file with EGMS-style parameters | `mintpy_postprocessing` | `ghcr.io/lukas-scharf-plus/mintpy_postprocessing` |
+| Point file with EGMS-style parameters | `mintpy_postprocessing` | `ghcr.io/lukas-scharf-plus/isce2-dolphin-minpty_postprocessing` |
 
 ## Files
 
@@ -50,7 +50,7 @@ All steps share one volume, mounted at `/work`:
 │   ├── isce/             ISCE2 topsStack           (not uploaded, ~5 GB per date)
 │   ├── crop/             AOI windows, water fraction -> output artifact
 │   ├── dolphin/          dolphin's work directory  -> output artifact
-│   ├── mintpy/           MintPy's work directory   -> output artifact
+│   ├── mintpy/           MintPy's work directory, incl. pic/ (figures of every step) -> output artifact
 │   ├── logs/             all pipeline logs, versions.json -> output artifact
 │   └── pipeline_config.yaml                       -> output artifact
 ├── final/
@@ -96,13 +96,13 @@ and the peak volume usage of the `isce`, `dolphin` and `mintpy` steps. It is wri
 
    Upload it again after every change. The workflow reads the bucket copy.
 3. The cluster needs the Kubernetes secret `cdse`, as for the compass-dolphin pipeline.
-4. For the ERA5 tropospheric correction (`mintpy.troposphere: pyaps`, the default in the
+4. For the ERA5 tropospheric correction (`mintpy.troposphericDelay.method: pyaps` in the
    config), the cluster needs the Kubernetes secret `cds` with the keys `CDS_URL` and
    `CDS_KEY`, your Copernicus Climate Data Store credentials. MintPy expects
    `CDS_URL=https://cds.climate.copernicus.eu/api`. MintPy and PyAPS read the
    credentials only from `~/.cdsapirc`, so the mintpy step writes that file from the
    two variables before MintPy starts. The secret is optional for the workflow. Without
-   it, set `troposphere: "no"` in the config, otherwise the ERA5 step fails.
+   it, set `mintpy.troposphericDelay.method: "no"` in the config, otherwise the ERA5 step fails.
 
 ### Submit
 
@@ -146,6 +146,11 @@ argo submit pipelines/isce2_dolphin_mintpy/workflow.yaml -p postprocess_all_pixe
   about 20 GB fixed. 2 months fit in the default 300 GB. For a longer period, raise
   `storage` under `volumeClaimTemplates`. Check the storage report of a first run, because
   these are estimates.
+- **MintPy options.** In the `mintpy` section of `pipeline.yaml`, every key that starts with
+  `mintpy.` is an original `smallbaselineApp.cfg` option, passed to MintPy unchanged. Any
+  MintPy option can be added there; see the isce2-dolphin-minpty README. An explicit
+  `mintpy.reference.date` must be a date of the processed period. The isce step checks
+  this before ISCE2 starts. Figures of every MintPy step are in `processed/mintpy/pic/`.
 - **Resources.** isce and dolphin request 8 CPUs and 32 GiB (limit 15 CPUs, 56 GiB, the
   cluster maximum per container). `isce.num_proc × isce.omp_threads` and
   `dolphin.threads_per_worker` in the config match the 8 CPUs. mintpy requests 4 CPUs

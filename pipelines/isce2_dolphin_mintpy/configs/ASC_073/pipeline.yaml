@@ -55,13 +55,44 @@ dolphin:
   n_parallel_unwrap: 4
 
 mintpy:
+  # --- pipeline options ---
   inversion: mintpy
-  min_temporal_coherence: 0.7
   dolphin_temporal_coherence_threshold: 0.6
-  unwrap_error_correction: "no"
+
+  # --- MintPy options ---
+  # Original smallbaselineApp.cfg names, ordered by processing step. They are written
+  # unchanged to processed/mintpy/isce_dolphin_mintpy.cfg, like a custom MintPy template.
+  # Every smallbaselineApp.cfg option can be added here; options not listed keep MintPy's
+  # default. Misspelled names stop the run. Quote yes/no.
+
+  ## computing resources
+  mintpy.compute.cluster: local
+  # "all" counts the cores of the whole node, not the 4-8 CPUs of the mintpy pod. If the
+  # step is slow from CPU throttling, set the number of pod CPUs (e.g. 8) instead.
+  mintpy.compute.numWorker: all
+  mintpy.compute.maxMemory: 16               # GB; the mintpy pod requests 16 GiB (limit 32 GiB)
+  ## reference_point
+  mintpy.reference.lalo: 48.19767391928604, 16.325432508158606
+  ## correct_unwrap_error
+  mintpy.unwrapError.method: bridging+phase_closure
+  ## invert_network
+  mintpy.networkInversion.maskDataset: connectComponent
+  mintpy.networkInversion.minTempCoh: 0.7
+  ## correct_troposphere
   # ERA5 tropospheric correction. The workflow writes the CDS credentials from the
   # Kubernetes secret `cds` (CDS_URL, CDS_KEY). Without that secret, set "no".
-  troposphere: pyaps
-  topographic_residual: true
-  deramp: "no"
-  geocode: true
+  mintpy.troposphericDelay.method: pyaps
+  mintpy.troposphericDelay.weatherModel: ERA5
+  ## deramp
+  mintpy.deramp: quadratic
+  ## correct_topography
+  mintpy.topographicResidual: "yes"
+  ## reference_date
+  # Must be an acquisition date of the processed period; this is checked before ISCE2
+  # starts. The workflow's default period (2025-01-01 ... 2025-02-28) does NOT contain
+  # 20220101: for that period use "auto" or a 2025 acquisition date.
+  mintpy.reference.date: "auto"
+  ## geocode
+  mintpy.geocode: "no"
+  ## plot: figures of every MintPy step in processed/mintpy/pic/ (uploaded with mintpy/)
+  mintpy.plot: "yes"

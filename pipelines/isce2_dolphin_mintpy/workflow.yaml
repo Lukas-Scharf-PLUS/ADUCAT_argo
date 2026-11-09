@@ -95,7 +95,7 @@ spec:
       - name: pipeline_image
         value: ghcr.io/lukas-scharf-plus/isce2-dolphin-mintpy:latest
       - name: postprocessing_image
-        value: ghcr.io/lukas-scharf-plus/mintpy_postprocessing:latest
+        value: ghcr.io/lukas-scharf-plus/isce2-dolphin-minpty_postprocessing:latest
 
   templates:
     - name: main
