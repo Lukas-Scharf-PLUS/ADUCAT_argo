@@ -22,8 +22,8 @@ paths:
 aoi:
   # Same area as the dolphin bounds of the compass-dolphin pipeline
   # [south, north, west, east]. ISCE2 processes all bursts overlapping it.
-  bbox: [48.11744, 48.32431, 16.18100, 16.58759]
-  buffer_m: 500
+  bbox: [48.1162927662246176, 48.3251054142921816, 16.1792116578268050, 16.5896908084970605]
+  buffer_m: 30
 
 water_mask:
   # Same water mask as the compass-dolphin pipeline (1 = land, 0 = water).
@@ -52,10 +52,10 @@ dolphin:
   # option, with description and default: isce2-dolphin-minpty/config/dolphin_options_reference.yaml.
   # The pipeline sets the SLC list, work directory, water mask and wavelength itself.
   output_options:
-    strides: {x: 4, y: 1}        # about 15 m x 14 m output pixels
+    strides: {x: 1, y: 1}        # if x:1 and y:1, about 4 m x 14 m output pixels
   phase_linking:
     ministack_size: 15
-    half_window: {x: 11, y: 5}
+    half_window: {x: 20, y: 5}
   interferogram_network:
     max_bandwidth: 3
   unwrap_options:
@@ -70,6 +70,11 @@ dolphin:
       ntiles: [2, 2]             # the whole of Vienna unwraps faster in tiles
   worker_settings:
     threads_per_worker: 8        # CPU request of the dolphin step
+    gpu_enabled: false
+    n_parallel_bursts: 1
+    block_shape:
+      - 256
+      - 256
 
 mintpy:
   # --- pipeline options ---
@@ -92,7 +97,7 @@ mintpy:
   ## correct_unwrap_error
   mintpy.unwrapError.method: bridging+phase_closure
   ## invert_network
-  mintpy.networkInversion.maskDataset: connectComponent
+  mintpy.networkInversion.maskDataset: "no"
   mintpy.networkInversion.minTempCoh: 0.7
   ## correct_troposphere
   # ERA5 tropospheric correction. The workflow writes the CDS credentials from the
@@ -109,6 +114,12 @@ mintpy:
   # 20220101: for that period use "auto" or a 2025 acquisition date.
   mintpy.reference.date: "auto"
   ## geocode
+  # The point file is built from the radar-coordinate files (inputs/geometryRadar.h5),
+  # so no geocoding is needed.
   mintpy.geocode: "no"
+  ## google_earth, hdfeos5: no exports, the point file is the only product.
+  # mintpy.save.kmz must be "no": its default (auto = yes) turns geocoding back on.
+  mintpy.save.kmz: "no"
+  mintpy.save.hdfEos5: "no"
   ## plot: figures of every MintPy step in processed/mintpy/pic/ (uploaded with mintpy/)
   mintpy.plot: "yes"
