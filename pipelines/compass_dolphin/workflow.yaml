@@ -581,7 +581,7 @@ spec:
           requests:
             # ~8 GB per IW SLC (2 months of track 73 is about 5-10 scenes),
             # plus GSLCs and dolphin output. Raise for longer periods.
-            storage: 150Gi
+            storage: 2000Gi
         storageClassName: csi-disk
 
   affinity:
