@@ -66,6 +66,7 @@ dolphin_postprocessing README, "Output file name and metadata".
 ```
 <s3_output_prefix>/<workflow name>/processed/compass
 <s3_output_prefix>/<workflow name>/processed/dolphin
+<s3_output_prefix>/<workflow name>/reference_point.json   (copy of processed/dolphin/reference_point.json)
 <s3_output_prefix>/<workflow name>/final/S1_..._<area_name>.parquet (and .metadata.json)
 ```
 
@@ -151,6 +152,12 @@ argo submit pipelines/compass_dolphin/workflow.yaml -p platforms=S1A \
   are listed in the `dolphin_postprocessing` README (`--exclude`).
 - `area_name`: name of the area in the point file name and metadata (default
   `vienna`). Empty leaves it out of the name.
+- `reference_point`: reference point of the dolphin time series as `"LON LAT"`
+  (WGS84 degrees), e.g. `-p reference_point="16.3804 48.1484"`. Empty (default)
+  lets dolphin pick the point. The point used is written to
+  `processed/dolphin/reference_point.json` and uploaded as
+  `<workflow name>/reference_point.json` (skipped, without failing the step, when
+  the dolphin config turns off the time series).
 
 For a longer period, also raise the volume size (`storage` under
 `volumeClaimTemplates`, about 8 GB per SLC).

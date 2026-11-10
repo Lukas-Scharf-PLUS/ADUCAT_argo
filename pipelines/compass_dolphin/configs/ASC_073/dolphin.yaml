@@ -69,7 +69,7 @@ output_options:
     y: 1
     # Decimation factor (stride) in the x/column direction.
     #   Type: integer.
-    x: 2
+    x: 1
   # EPSG code of desired output products (for geocoded SLCs only). If None, uses the most
   #   common projection of the input data.
   #   Type: integer | null.

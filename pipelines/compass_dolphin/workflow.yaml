@@ -84,6 +84,11 @@ spec:
         value: WP5_Infrastructure_and_Underground_Safety/argo_configs/compass_dolphin/ASC_073/compass.yaml
       - name: dolphin_config_key
         value: WP5_Infrastructure_and_Underground_Safety/argo_configs/compass_dolphin/ASC_073/dolphin.yaml
+      # Reference point of the dolphin time series as "LON LAT" (WGS84 degrees),
+      # e.g. "16.3804 48.1484". Empty (default): dolphin picks the point itself.
+      # The point used is written to processed/dolphin/reference_point.json.
+      - name: reference_point
+        value: ""
 
       # --- outputs ---
       - name: s3_output_prefix
@@ -317,6 +322,15 @@ spec:
               key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/processed/dolphin"
             archive:
               none: {}
+          # The reference point used, also as its own file. Optional: it is not
+          # written when the dolphin config turns off the time series.
+          - name: reference-point
+            path: /work/processed/dolphin/reference_point.json
+            optional: true
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/reference_point.json"
+            archive:
+              none: {}
       container:
         image: "{{workflow.parameters.compass_dolphin_image}}"
         # Same wrapper with peak tracking as the compass step.
@@ -337,13 +351,17 @@ spec:
                 wait "$nap"
               done ) &
             sampler=$!
-            "$@" 2>&1 | tee "$0"
+            # REFERENCE_POINT ("LON LAT") is left unquoted so it splits into the
+            # two values of --reference-point; empty adds no option.
+            "$@" ${REFERENCE_POINT:+--reference-point $REFERENCE_POINT} 2>&1 | tee "$0"
             status=$?
             kill "$sampler" 2>/dev/null
             exit "$status"
         env:
           - name: PEAK_FILE
             value: /work/logs/peak_dolphin.bytes
+          - name: REFERENCE_POINT
+            value: "{{workflow.parameters.reference_point}}"
         args:
           - /work/processed/dolphin/run_pipeline_dolphin.log
           - python
