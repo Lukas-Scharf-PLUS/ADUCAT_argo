@@ -32,7 +32,7 @@ download-slc -> download-orbits -> isce -> dolphin -> mintpy -> postprocess
 | Step | Command in the pipeline image | What it does |
 | --- | --- | --- |
 | `isce` | `run pipeline.yaml --steps isce crop` | DEM conversion and cut, swath selection, ISCE2 topsStack (NESD) of all bursts covering the AOI. Then the AOI crop in radar coordinates and the water fraction on dolphin's grid |
-| `dolphin` | `run pipeline.yaml --steps dolphin` | phase linking, interferograms, unwrapping with the water mask |
+| `dolphin` | `run pipeline.yaml --steps dolphin` | phase linking, interferograms, unwrapping (whirlwind) with the water mask |
 | `mintpy` | `run pipeline.yaml --steps mintpy` | MintPy inputs from dolphin and ISCE2, network inversion, corrections, geocoding |
 | `postprocess` | `run_postprocessing.py --run-dir /work/processed` | one GeoParquet point file |
 
@@ -153,8 +153,13 @@ argo submit pipelines/isce2_dolphin_mintpy/workflow.yaml -p postprocess_all_pixe
   this before ISCE2 starts. Figures of every MintPy step are in `processed/mintpy/pic/`.
 - **Resources.** isce and dolphin request 8 CPUs and 32 GiB (limit 15 CPUs, 56 GiB, the
   cluster maximum per container). `isce.num_proc × isce.omp_threads` and
-  `dolphin.threads_per_worker` in the config match the 8 CPUs. mintpy requests 4 CPUs
-  and 16 GiB.
+  `dolphin.worker_settings.threads_per_worker` and
+  `dolphin.unwrap_options.whirlwind_options.num_threads` in the config match the 8 CPUs.
+  mintpy requests 4 CPUs and 16 GiB.
+- **dolphin options.** The `dolphin` section of `pipeline.yaml` uses dolphin's own config
+  structure, and every dolphin option can be set there. The isce2-dolphin-minpty file
+  `config/dolphin_options_reference.yaml` lists them all. Unwrapping uses whirlwind
+  (whirlwind-insar 0.10.0), like the compass-dolphin pipeline.
 - **Images** default to `latest` with `imagePullPolicy: Always`. Pin `sha-<commit>`
   tags for reproducible runs. The pipeline image records its commit in
   `processed/logs/versions.json` and in the point file's metadata.

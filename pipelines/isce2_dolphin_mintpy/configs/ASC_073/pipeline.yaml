@@ -42,21 +42,37 @@ isce:
   num_proc4topo: 4
   omp_threads: 2
 
+# Who turns the interferograms into a time series; affects the dolphin AND the mintpy step:
+#   mintpy  = MintPy network inversion (with unwrapping error correction)
+#   dolphin = dolphin's own time series; MintPy only applies the corrections
+inversion: mintpy
+
 dolphin:
-  strides_x: 4                   # about 15 m x 14 m output pixels
-  strides_y: 1
-  half_window_x: 11
-  half_window_y: 5
-  ministack_size: 15
-  max_bandwidth: 3
-  unwrap_method: snaphu
-  snaphu_ntiles: [2, 2]          # the whole of Vienna unwraps faster in tiles
-  threads_per_worker: 8          # CPU request of the dolphin step
-  n_parallel_unwrap: 4
+  # dolphin's own config structure (same names and nesting as a dolphin YAML). Every
+  # option, with description and default: isce2-dolphin-minpty/config/dolphin_options_reference.yaml.
+  # The pipeline sets the SLC list, work directory, water mask and wavelength itself.
+  output_options:
+    strides: {x: 4, y: 1}        # about 15 m x 14 m output pixels
+  phase_linking:
+    ministack_size: 15
+    half_window: {x: 11, y: 5}
+  interferogram_network:
+    max_bandwidth: 3
+  unwrap_options:
+    # Same unwrapper as the compass-dolphin pipeline (whirlwind-insar 0.10.0).
+    unwrap_method: whirlwind
+    # Not -1 (auto): auto starts CPUs // 4 unwraps, counted on the whole node, not on
+    # the 8 CPUs of the dolphin pod. Each unwrap uses about 4 threads.
+    n_parallel_jobs: 2
+    whirlwind_options:
+      num_threads: 8             # CPU request of the dolphin step, shared by both unwraps
+    snaphu_options:              # only used with unwrap_method: snaphu
+      ntiles: [2, 2]             # the whole of Vienna unwraps faster in tiles
+  worker_settings:
+    threads_per_worker: 8        # CPU request of the dolphin step
 
 mintpy:
   # --- pipeline options ---
-  inversion: mintpy
   dolphin_temporal_coherence_threshold: 0.6
 
   # --- MintPy options ---
