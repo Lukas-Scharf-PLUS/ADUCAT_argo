@@ -32,7 +32,7 @@ download-slc -> download-orbits -> isce -> dolphin -> mintpy -> postprocess
 | Step | Command in the pipeline image | What it does |
 | --- | --- | --- |
 | `isce` | `run pipeline.yaml --steps isce crop` | DEM conversion and cut, swath selection, ISCE2 topsStack (NESD) of all bursts covering the AOI. Then the AOI crop in radar coordinates and the water fraction on dolphin's grid |
-| `dolphin` | `run pipeline.yaml --steps dolphin` | phase linking, interferograms, unwrapping (whirlwind) with the water mask |
+| `dolphin` | `run pipeline.yaml --steps dolphin subpixel` | phase linking, interferograms, unwrapping (whirlwind) with the water mask. Then, only with `subpixel.enabled: true` in `pipeline.yaml`, the sub-pixel PS positions (`processed/subpixel/`, uploaded); otherwise that step is skipped |
 | `mintpy` | `run pipeline.yaml --steps mintpy` | MintPy inputs from dolphin and ISCE2, network inversion, corrections, geocoding |
 | `postprocess` | `run_postprocessing.py --run-dir /work/processed` | one GeoParquet point file |
 

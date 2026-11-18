@@ -76,6 +76,15 @@ dolphin:
       - 256
       - 256
 
+subpixel:
+  # Optional sub-pixel position of the PS from the SLC amplitudes (runs in the dolphin
+  # step of the workflow, after dolphin). true writes processed/subpixel/*.tif
+  # (offsets, their spread over the dates, on_peak flag, lat/lon/height per PS);
+  # false skips it and the run is the same as without this section.
+  # Needs a pipeline image that knows this option (isce2-dolphin-minpty with subpixel.py);
+  # older images stop with "Unknown config section(s): ['subpixel']".
+  enabled: false
+
 mintpy:
   # --- pipeline options ---
   dolphin_temporal_coherence_threshold: 0.6

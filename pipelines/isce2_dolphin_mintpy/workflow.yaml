@@ -4,7 +4,9 @@
 #
 # - isce:        ISCE2 topsStack coregistration with ESD of all bursts covering the
 #                AOI, then the AOI crop in radar coordinates and the water mask.
-# - dolphin:     phase linking, interferograms and unwrapping on the cropped stack.
+# - dolphin:     phase linking, interferograms and unwrapping on the cropped stack,
+#                then the optional sub-pixel PS positions (only with subpixel.enabled
+#                in pipeline.yaml; otherwise that step is skipped).
 # - mintpy:      network inversion, corrections and geocoding.
 # - postprocess: one GeoParquet point file (mintpy_postprocessing).
 # isce, dolphin and mintpy are separate steps of the same image, so the log and
@@ -23,7 +25,8 @@
 #                     storage_report.txt/.json
 #
 # Uploaded to <s3_output_prefix>/<workflow name>/: processed/crop, processed/dolphin,
-# processed/mintpy, processed/logs, processed/pipeline_config.yaml, final/, logs/.
+# processed/subpixel (only with subpixel.enabled), processed/mintpy, processed/logs,
+# processed/pipeline_config.yaml, final/, logs/.
 # The SLCs, orbits and the ISCE2 stack (~5 GB per date) are not uploaded.
 #
 # Submit with:  argo submit pipelines/isce2_dolphin_mintpy/workflow.yaml
@@ -298,7 +301,9 @@ spec:
             mountPath: /work
         imagePullPolicy: Always
 
-    # Phase linking, interferograms and unwrapping on the cropped radar stack.
+    # Phase linking, interferograms and unwrapping on the cropped radar stack, then the
+    # optional sub-pixel PS positions. The subpixel step reads the full-resolution SLCs
+    # of the ISCE2 stack, which only exist on this volume, so it runs here and not later.
     - name: dolphin
       outputs:
         artifacts:
@@ -306,6 +311,14 @@ spec:
             path: /work/processed/dolphin
             s3:
               key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/processed/dolphin"
+            archive:
+              none: {}
+          # Only written with subpixel.enabled: true in pipeline.yaml.
+          - name: subpixel
+            path: /work/processed/subpixel
+            optional: true
+            s3:
+              key: "{{workflow.parameters.s3_output_prefix}}/{{workflow.name}}/processed/subpixel"
             archive:
               none: {}
           # All pipeline logs so far (ISCE2 per-command logs, dolphin, MintPy,
@@ -355,6 +368,8 @@ spec:
           - /work/input/config/pipeline.yaml
           - --steps
           - dolphin
+          # Skipped (one log line) unless subpixel.enabled is true in pipeline.yaml.
+          - subpixel
         resources:
           # threads_per_worker in the pipeline config = 8.
           requests: {cpu: "8", memory: 32Gi}
